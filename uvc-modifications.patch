@@ -1,0 +1,1399 @@
+SPDX-License-Identifier: GPL-2.0-only
+Copyright (C) 2026 Shingo Noguchi
+
+【ライセンス】
+  本パッチは Linux カーネルの uvcvideo ドライバ (drivers/media/usb/uvc/) を改変する
+  派生物であり、GNU General Public License version 2 のみ (GPL-2.0-only) の下で
+  配布する。uvcvideo の .c は GPL-2.0-or-later だが、同時に改変する uvcvideo.h が
+  GPL-2.0-only のため、パッチ全体を GPL-2.0-only として扱う。全文はリポジトリ直下の
+  LICENSE を参照。
+  ビルドした uvcvideo.ko や .deb を第三者へ配布する (製品への組み込みを含む) 場合は、
+  GPLv2 第3条に従い、本パッチとベースにした linux-source の版 (.kernel-refs/ に記録)
+  からなる完全な対応ソースを提供すること。本パッチは公開リポジトリ
+  https://github.com/go-surgeons/uvc-patch で同じ版のタグ付きで公開している。
+  GPLv2 第2条(a) の変更告知として、改変する各ファイルの先頭に "Modified by"
+  コメントを挿入する hunk をパッチ末尾に置いている (リベース時も維持する)。
+
+================================================================================
+ uvcvideo 互換性パッチ: maxpsize=0 を報告する UVC カメラ対応 (Linux 6.18 ベース)
+================================================================================
+
+【目的】
+対象カメラの3つの非標準挙動を UVC ドライバで吸収する。USB ID ではなく
+「maxpsize=0 報告」を挙動トリガに Quirk を自動付与するので、同種の他デバイス
+にも効く。uvc_parse_streaming() が maxpsize==0 を検出した時点で、下記3対策の
+Quirk を PROBE_MINMAX と共に dev->quirks へ OR する。
+dmesg: "uvcvideo: Detected maxpsize=0, applying compatibility quirks"
+
+【対応する問題と対策】
+  問題1: maxpsize=0 報告で帯域チェック失敗 → 最低解像度(1284x720/30)へ転落。
+    → IGNORE_ZERO_MAXPSIZE: maxpsize==0 なら帯域チェックを break でスキップ。
+  問題2: GET_CUR(PROBE) が EPIPE で失敗、または要求解像度を無視した値を返す。
+    → IGNORE_GET_CUR の3経路:
+      (a) uvc_video_init の初回 GET_CUR 失敗 → format[0]/frame[0] から probe を
+          合成し ret=0 で登録継続(/dev/video を生成)。実解像度は後段の
+          uvc_probe_video で再ネゴシエートされる。
+      (b) uvc_probe_video ループ内の失敗 → 直前 SET_CUR 値(probe_backup)で復元し
+          uvc_fixup_video_ctrl で dwMaxVideoFrameSize/dwMaxPayloadTransferSize 再計算。
+      (c) GET_CUR が解像度を書き換えた → bFormatIndex/bFrameIndex を復元し再計算。
+  問題3: GET_MIN/MAX(PROBE) も EPIPE で失敗。
+    → 既存 PROBE_MINMAX を併せて自動付与(MIN/MAX 取得ブロックを丸ごとスキップ)。
+
+【独立機能: UYVY を YUYV として公開 (maxpsize=0 quirk とは無関係)】
+  Chrome 等は UYVY 非対応(YUYV/MJPEG のみ)。両者はバイト順のみ違うため、全 UVC
+  デバイスで UYVY→YUYV に張り替え(uvc_driver.c)、UVC_FMT_FLAG_BSWAP16(uvcvideo.h)
+  を立て、DQBUF パス(uvc_queue.c の buf_finish=プロセスコンテキスト)で u16
+  byteswap する。maxpsize=0/USB-ID には非依存。
+  リベース: フラグ 0x00000004 が上流と衝突したら Format flags 末尾へ再割当 /
+  張り替えは FORCE_Y8/FORCE_BPP ブロックの後 / swab は必ず buf_finish で行う
+  (URB complete=softirq 不可。ビデオキュー専用ゆえバッファ型ガード不要)。
+
+【リベース時に必ず維持する要素】(このパッチの正規の指針)
+  適用順は uvcvideo.h(定義) → uvc_driver.c(付与) → uvc_video.c(参照)。
+  - Quirk ビットは u32 quirks の最上位から下向きに確保(値と根拠は下記
+    [uvcvideo.h] 節)。上流は下位から昇順なので当分衝突しない。
+  - Quirk 付与は uvc_parse_streaming() の altsetting 解析ループ終了直後
+    (dev->streams への add_tail 直前)に maxpsize==0 判定として挿入。
+  - uvc_video_init/uvc_probe_video の SET_CUR→GET_CUR ループで以下を維持:
+    (1) 各イテレーション先頭で probe を probe_backup にコピー。
+    (2) GET_CUR エラー時は quirk 下で probe_backup 復元 + uvc_fixup_video_ctrl(問題2b)。
+    (3) GET_CUR が解像度を書き換えたら復元(問題2c)。
+    (4) IGNORE_ZERO_MAXPSIZE && maxpsize==0 で帯域チェックを break(問題1)。
+    (5) 初回 GET_CUR 失敗は format[0]/frame[0] 合成で ret=0 継続(問題2a)。
+  - デバッグログ(pr_info/uvc_dbg)は機能に無関係。衝突時は捨ててよい。
+  - パッチ末尾の [全ファイル] 変更告知 hunk (各ファイル先頭の SPDX 行直後に
+    "Modified by" コメントを挿入) は GPLv2 第2条(a) の要件。機能に無関係だが
+    捨てない。元ファイル先頭固定 (先頭コンテキスト1行・末尾3行) で他 hunk の後に
+    当たるため行番号調整は不要。年は改変した年に更新する。
+  - hunk 整形時は各 hunk の末尾コンテキスト行数 >= 先頭コンテキスト行数に
+    すること。GNU patch 2.8 (Debian trixie) には先頭側が多い非対称 hunk の
+    照合に失敗するリグレッションがあり、fuzz で救えない(3行超の)非対称は
+    reject される。
+
+================================================================================
+ [uvcvideo.h] URB個数拡張 + Quirkビット定義
+================================================================================
+意図:
+  - UVC_URBS (5 → 64):
+      対象カメラのような高帯域 bulk EP デバイスで、デフォルト 5 個では
+      total プール (5 × UVC_MAX_PACKETS × MaxPacketSize) が
+      ホストコールバックのレイテンシ余裕に対して小さすぎ、デバイス内
+      FIFO 溢れで送信停止 → DQBUF が返らずアプリがフリーズする問題への
+      対策。1920x1080@60 (237 MB/s) で再現する stall がこれで解消する。
+      32 でも短時間 (5秒) は通るが、1分超の連続キャプチャでサイレント
+      フリーズが再発したため 64 まで引き上げ済 (2分超で安定確認)。
+      重要: 1 URB の **サイズ** (UVC_MAX_PACKETS) は据え置く。
+      サイズを拡張すると bulk decoder が UVC payload 境界の short packet
+      を見落とし、フレーム断片化や緑ノイズが発生するため。
+      副作用: struct uvc_streaming サイズが ~1MB 増 (1ストリームあたり)。
+  - UVC_QUIRK_IGNORE_ZERO_MAXPSIZE (0x20000000):
+      maxpsize=0 報告時に帯域チェックをスキップさせる。
+  - UVC_QUIRK_IGNORE_GET_CUR (0x40000000):
+      GET_CUR(PROBE) の失敗/書き換えを補正する。
+  両フラグは uvc_driver.c の uvc_parse_streaming() で maxpsize==0 を
+  検出した際に UVC_QUIRK_PROBE_MINMAX と共に OR 付与される
+  (個別Quirkとしても利用可)。
+
+  ビット値の選定: u32 quirks の最上位ビットから下向きに確保する
+  (0x20000000 / 0x40000000。STREAM_RECOVERY は 0x80000000)。上流は
+  下位ビットから昇順に quirk を増やすため(6.18 時点の最上位は
+  0x00040000=MSXU_META、6.12 は 0x00020000)、上位側との間にビット
+  19〜28 の緩衝を挟み当分は衝突しない。個別の上流追加を追跡して空き
+  ビットを探す(旧方式で 0x00040000 を意図的に空ける等)必要がなくなる。
+  万一上位側まで埋まったら 0x10000000... と下へ再割当し、参照箇所を
+  同時更新すること。
+
+  位置(source anchor)の注意:
+    - 下記 uvcvideo.h hunk (@@ -82,3) は /* Format flags */ の trailing
+      context のみで anchor する。上流固有の quirk 行(MSXU_META 等)を
+      context に含めると 6.12/6.18 で不一致となり reject されるため。
+
+--- a/uvc/uvcvideo.h
++++ b/uvc/uvcvideo.h
+@@ -51,7 +51,7 @@
+ #define DRIVER_VERSION		"1.1.1"
+
+ /* Number of isochronous URBs. */
+-#define UVC_URBS		5
++#define UVC_URBS		64
+ /* Maximum number of packets per URB. */
+ #define UVC_MAX_PACKETS		32
+
+@@ -82,3 +82,5 @@
++#define UVC_QUIRK_IGNORE_ZERO_MAXPSIZE	0x20000000
++#define UVC_QUIRK_IGNORE_GET_CUR	0x40000000
+
+ /* Format flags */
+ #define UVC_FMT_FLAG_COMPRESSED		0x00000001
+@@ -83,5 +85,6 @@
+ /* Format flags */
+ #define UVC_FMT_FLAG_COMPRESSED		0x00000001
+ #define UVC_FMT_FLAG_STREAM		0x00000002
++#define UVC_FMT_FLAG_BSWAP16		0x00000004
+ 
+
+================================================================================
+ [uvc_driver.c] maxpsize=0検出時に対策 Quirk を自動付与
+================================================================================
+意図:
+  - hunk1 (uvc_parse_streaming @ ~L781): 【核心】altsetting解析ループ
+    終了後に maxpsize==0 を検出したら、
+    UVC_QUIRK_IGNORE_ZERO_MAXPSIZE / UVC_QUIRK_IGNORE_GET_CUR /
+    UVC_QUIRK_PROBE_MINMAX の3つを dev->quirks に OR で立てる。
+    対象カメラを挙動ベースで自動識別する要。
+  - hunk2 (~L2537): uvc_quirk_ignore_zero_maxpsize 構造体定義のみ追加
+    (USB ID テーブルには未登録)。将来的に個別IDで強制適用する場合の
+    予約スロット。削除しても現行動作には影響なし。
+
+--- a/uvc/uvc_driver.c
++++ b/uvc/uvc_driver.c
+@@ -313,7 +313,19 @@
+ 				format->bpp = DIV_ROUND_UP(8 * n, div);
+ 			}
+ 		}
+
++		/*
++		 * Chrome and other V4L2 capture consumers reject UYVY but
++		 * accept YUYV. The two differ only by byte order within each
++		 * 16-bit unit, so advertise UYVY formats as YUYV and byte-swap
++		 * the frame data in the DQBUF path (UVC_FMT_FLAG_BSWAP16,
++		 * handled in uvc_buffer_finish(), the vb2 .buf_finish callback).
++		 */
++		if (format->fcc == V4L2_PIX_FMT_UYVY) {
++			format->fcc = V4L2_PIX_FMT_YUYV;
++			format->flags |= UVC_FMT_FLAG_BSWAP16;
++		}
++
+ 		if (buffer[2] == UVC_VS_FORMAT_UNCOMPRESSED) {
+ 			ftype = UVC_VS_FRAME_UNCOMPRESSED;
+ 		} else {
+@@ -781,6 +793,14 @@
+ 			streaming->maxpsize = psize;
+ 	}
+ 
++	/* Apply quirks for devices that report zero maxpsize */
++	if (streaming->maxpsize == 0) {
++		pr_info("uvcvideo: Detected maxpsize=0, applying compatibility quirks\n");
++		dev->quirks |= UVC_QUIRK_IGNORE_ZERO_MAXPSIZE
++			    | UVC_QUIRK_IGNORE_GET_CUR
++			    | UVC_QUIRK_PROBE_MINMAX;
++	}
++
+ 	list_add_tail(&streaming->list, &dev->streams);
+ 	return 0;
+ 
+@@ -2529,7 +2549,11 @@
+ 	.quirks = UVC_QUIRK_FORCE_Y8,
+ };
+ 
++static const struct uvc_device_info uvc_quirk_ignore_zero_maxpsize = {
++	.quirks = UVC_QUIRK_IGNORE_ZERO_MAXPSIZE,
++};
++
+ #define UVC_INFO_QUIRK(q) (kernel_ulong_t)&(struct uvc_device_info){.quirks = q}
+ #define UVC_INFO_META(m) (kernel_ulong_t)&(struct uvc_device_info) \
+ 	{.meta_format = m}
+
+================================================================================
+ [uvc_video.c] GET_CUR 失敗/誤動作の補正と probe 合成
+================================================================================
+意図:
+  - uvc_probe_video の SET_CUR→GET_CUR ループ:
+      * イテレーション先頭で probe を probe_backup にコピー。
+      * GET_CUR がエラーを返した場合(EPIPE等)、UVC_QUIRK_IGNORE_GET_CUR
+        ありなら *probe = probe_backup で復元、uvc_fixup_video_ctrl()
+        で dwMaxVideoFrameSize / dwMaxPayloadTransferSize を埋める。
+      * GET_CUR が成功したが解像度を書き換えた場合は、
+        bFormatIndex/bFrameIndex を復元し dwMaxVideoFrameSize を再計算。
+      * UVC_QUIRK_IGNORE_ZERO_MAXPSIZE && maxpsize==0 のときに帯域
+        チェックをスキップして break (= 最低解像度フォールバック防止)。
+    マージ衝突時はこの4要素(退避/復元/書き換え復元/スキップ)を必ず維持。
+  - uvc_video_init の初回 GET_CUR(PROBE) 失敗時の合成パス:
+      * GET_CUR が失敗 && UVC_QUIRK_IGNORE_GET_CUR ありなら、probe を
+        ゼロクリアし format[0]/frame[0] から bFormatIndex/bFrameIndex/
+        dwFrameInterval を埋める。dwClockFrequency は dev->clock_frequency
+        を使用。uvc_fixup_video_ctrl で dwMaxVideoFrameSize を補完、
+        dwMaxPayloadTransferSize もゼロなら同値を入れる。
+      * ret=0 に書き換えて続行 → /dev/video ノードが作成される。
+      * 実際の解像度/フレームレートは V4L2 アプリの VIDIOC_S_FMT 後の
+        uvc_probe_video で再ネゴシエートされる。
+
+--- a/uvc/uvc_video.c
++++ b/uvc/uvc_video.c
+@@ -430,6 +430,9 @@
+ 	unsigned int i;
+ 	int ret;
+ 
++	uvc_dbg(stream->dev, VIDEO, "uvc_probe_video: requested format %u, frame %u\n",
++		probe->bFormatIndex, probe->bFrameIndex);
++
+ 	/*
+ 	 * Perform probing. The device should adjust the requested values
+ 	 * according to its capabilities. However, some devices, namely the
+@@ -438,6 +441,8 @@
+ 	 * that reason, if the needed bandwidth exceeds the maximum available
+ 	 * bandwidth, try to lower the quality.
+ 	 */
++	uvc_dbg(stream->dev, VIDEO, "Initial SET_CUR: format %u, frame %u\n",
++		probe->bFormatIndex, probe->bFrameIndex);
+ 	ret = uvc_set_video_ctrl(stream, probe, 1);
+ 	if (ret < 0)
+ 		goto done;
+@@ -455,19 +460,85 @@
+ 	}
+ 
+ 	for (i = 0; i < 2; ++i) {
++		struct uvc_streaming_control probe_backup = *probe;
++		uvc_dbg(stream->dev, VIDEO, "Before SET_CUR: format %u, frame %u\n",
++			probe->bFormatIndex, probe->bFrameIndex);
+ 		ret = uvc_set_video_ctrl(stream, probe, 1);
+ 		if (ret < 0)
+ 			goto done;
+ 		ret = uvc_get_video_ctrl(stream, probe, 1, UVC_GET_CUR);
+-		if (ret < 0)
+-			goto done;
++		if (ret < 0) {
++			/*
++			 * IGNORE_GET_CUR workaround: GET_CUR can stall entirely. Since
++			 * the preceding SET_CUR succeeded, the device has
++			 * accepted our request — restore the backup and treat
++			 * the GET_CUR as if it echoed back the same values.
++			 */
++			if (stream->dev->quirks & UVC_QUIRK_IGNORE_GET_CUR) {
++				uvc_dbg(stream->dev, VIDEO,
++					"IGNORE_GET_CUR workaround: GET_CUR failed (%d), using SET_CUR values\n",
++					ret);
++				*probe = probe_backup;
++				uvc_fixup_video_ctrl(stream, probe);
++				if (probe->dwMaxPayloadTransferSize == 0)
++					probe->dwMaxPayloadTransferSize = probe->dwMaxVideoFrameSize;
++				ret = 0;
++			} else {
++				goto done;
++			}
++		}
+ 
+-		if (stream->intf->num_altsetting == 1)
++		uvc_dbg(stream->dev, VIDEO, "After GET_CUR: format %u, frame %u, dwMaxPayloadTransferSize=%u\n",
++			probe->bFormatIndex, probe->bFrameIndex, probe->dwMaxPayloadTransferSize);
++
++		/* IGNORE_GET_CUR workaround: ignore GET_CUR result if it changed resolution */
++		if ((stream->dev->quirks & UVC_QUIRK_IGNORE_GET_CUR) &&
++		    (probe->bFormatIndex != probe_backup.bFormatIndex ||
++		     probe->bFrameIndex != probe_backup.bFrameIndex)) {
++			const struct uvc_format *format;
++			const struct uvc_frame *frame;
++			
++			uvc_dbg(stream->dev, VIDEO, "IGNORE_GET_CUR workaround: restoring requested format/frame\n");
++			probe->bFormatIndex = probe_backup.bFormatIndex;
++			probe->bFrameIndex = probe_backup.bFrameIndex;
++			
++			/* Recalculate dwMaxVideoFrameSize for the requested resolution */
++			if (probe->bFormatIndex > 0 && probe->bFormatIndex <= stream->nformats &&
++			    probe->bFrameIndex > 0) {
++				format = &stream->formats[probe->bFormatIndex - 1];
++				if (probe->bFrameIndex <= format->nframes) {
++					frame = &format->frames[probe->bFrameIndex - 1];
++					
++					if (!(format->flags & UVC_FMT_FLAG_COMPRESSED))
++						probe->dwMaxVideoFrameSize = frame->dwMaxVideoFrameBufferSize;
++					
++					uvc_dbg(stream->dev, VIDEO, "IGNORE_GET_CUR workaround: recalculated dwMaxVideoFrameSize=%u\n",
++						probe->dwMaxVideoFrameSize);
++				}
++			}
++		}
++
++		if (stream->intf->num_altsetting == 1) {
++			uvc_dbg(stream->dev, VIDEO, "Single altsetting, skipping bandwidth check\n");
+ 			break;
++		}
++
++		uvc_dbg(stream->dev, VIDEO, "Probe loop %d: dwMaxPayloadTransferSize=%u, maxpsize=%u\n",
++			i, probe->dwMaxPayloadTransferSize, stream->maxpsize);
+ 
+ 		if (probe->dwMaxPayloadTransferSize <= stream->maxpsize)
+ 			break;
+ 
++		/* Skip bandwidth check for devices with zero maxpsize quirk */
++		if ((stream->dev->quirks & UVC_QUIRK_IGNORE_ZERO_MAXPSIZE) &&
++		    stream->maxpsize == 0) {
++			uvc_dbg(stream->dev, VIDEO, "Skipping bandwidth check due to zero maxpsize (quirks=0x%x)\n",
++				stream->dev->quirks);
++			uvc_dbg(stream->dev, VIDEO,
++				"Skipping bandwidth check due to zero maxpsize\n");
++			break;
++		}
++
+ 		if (stream->dev->quirks & UVC_QUIRK_PROBE_MINMAX) {
+ 			ret = -ENOSPC;
+ 			goto done;
+@@ -481,6 +552,8 @@
+ 	}
+ 
+ done:
++	uvc_dbg(stream->dev, VIDEO, "uvc_probe_video result: format %u, frame %u (ret=%d)\n",
++		probe->bFormatIndex, probe->bFrameIndex, ret);
+ 	return ret;
+ }
+ 
+@@ -2226,6 +2299,36 @@
+ 		usb_reset_device(stream->dev->udev);
+ 	}
+ 
++	/*
++	 * IGNORE_GET_CUR workaround: when the initial GET_CUR(PROBE) stalls, the
++	 * device cannot be registered through the normal path. Synthesize a
++	 * default probe control from the first format/frame descriptor so the
++	 * V4L2 layer can still create /dev/video. Real negotiation happens
++	 * later in uvc_probe_video() when an application sets a format.
++	 */
++	if (ret < 0 && (stream->dev->quirks & UVC_QUIRK_IGNORE_GET_CUR)) {
++		dev_info(&stream->intf->dev,
++			 "GET_CUR(PROBE) failed (%d), synthesizing defaults (UVC_QUIRK_IGNORE_GET_CUR)\n",
++			 ret);
++		memset(probe, 0, sizeof(*probe));
++		if (stream->nformats > 0) {
++			const struct uvc_format *fmt0 = &stream->formats[0];
++
++			probe->bFormatIndex = fmt0->index;
++			if (fmt0->nframes > 0) {
++				const struct uvc_frame *frm0 = &fmt0->frames[0];
++
++				probe->bFrameIndex = frm0->bFrameIndex;
++				probe->dwFrameInterval = frm0->dwDefaultFrameInterval;
++			}
++		}
++		probe->dwClockFrequency = stream->dev->clock_frequency;
++		uvc_fixup_video_ctrl(stream, probe);
++		if (probe->dwMaxPayloadTransferSize == 0)
++			probe->dwMaxPayloadTransferSize = probe->dwMaxVideoFrameSize;
++		ret = 0;
++	}
++
+ 	if (ret < 0)
+ 		return ret;
+ 
+--- a/uvc/uvc_queue.c
++++ b/uvc/uvc_queue.c
+@@ -16,4 +16,5 @@
+ #include <linux/vmalloc.h>
+ #include <linux/wait.h>
+ #include <media/videobuf2-v4l2.h>
++#include <linux/swab.h>
+ #include <media/videobuf2-vmalloc.h>
+@@ -153,8 +154,25 @@
+ 	struct uvc_streaming *stream = uvc_queue_to_stream(queue);
+ 	struct uvc_buffer *buf = uvc_vbuf_to_buffer(vbuf);
+
+-	if (vb->state == VB2_BUF_STATE_DONE)
+-		uvc_video_clock_update(stream, vbuf, buf);
++	if (vb->state == VB2_BUF_STATE_DONE) {
++		/*
++		 * UYVY-as-YUYV: byte-swap each 16-bit unit of the frame so
++		 * consumers (e.g. Chrome) receive correct YUYV. Done in the
++		 * DQBUF path (buf_finish, always process context) rather than
++		 * at frame completion, which can run in the URB completion
++		 * softirq. buf_finish is registered only on the video queue,
++		 * so no buffer-type guard is needed.
++		 */
++		if (buf->mem && stream->cur_format &&
++		    (stream->cur_format->flags & UVC_FMT_FLAG_BSWAP16)) {
++			u16 *p = buf->mem;
++			unsigned int n = buf->bytesused / 2, i;
++
++			for (i = 0; i < n; i++)
++				p[i] = swab16(p[i]);
++		}
++		uvc_video_clock_update(stream, vbuf, buf);
++	}
+ }
+
+
+================================================================================
+ [カーネル内フレーム断自動復帰] uvcvideo.h / uvc_driver.c / uvc_video.c / uvc_debugfs.c
+================================================================================
+【独立機能: カーネル内フレーム断自動復帰（maxpsize=0 quirk 連動）】
+  対象カメラは streaming 中に URB completion が無言で止まり、フレームが
+  途絶する(wedge)。実地観測(2026-07-17/18、計9時間・自然発生 wedge 56回、
+  usbmon 裏取り。docs/investigations/2026-07-18-three-tier-recovery-field-
+  observation.md)では全エピソードがエラー completion を一切伴わない
+  silent-stop であり、EPROTO 等のエラーバーストは一度も観測されていない。
+  本機能はドライバ内で検知し V4L2 アプリに透過復帰する:
+    検知: 無フレームタイマのみ(recovery_timeout_ms、既定0=auto —
+          フレーム間隔x4 を 30〜1000ms にクランプ。1080p60 では実効
+          64ms。健全時のペイロードギャップはフレームスキップ=フレーム
+          間隔の整数倍に量子化されており、実地観測(usbmon 55分・自然
+          wedge 37件周辺)の定常最大は 2.4 フレーム間隔(40.2ms)。wedge
+          は自己回復しないため 4 フレーム間隔で両者を明確に分離でき、
+          低fpsモードも自動スケールする(調査: docs/investigations/
+          2026-07-18-recovery-detection-latency-tuning.md)。>0 で従来
+          どおり固定msに上書き。タイマ再武装は timeout/4(下限10ms)
+          周期で、検知遅延 = timeout + 再武装粒度 = 1080p60 実測
+          64〜80ms。watchdog WD_MS=2000ms より先に発火させる)
+    復帰: workqueue で suspend/resume 相当の再循環
+          (frozen=1 → stop_transfer(0) → alt0(iso)/CLEAR_HALT(bulk) →
+           作りかけバッファの巻き戻し+RESYNC武装 → settle
+           (recovery_settle_ms、既定10ms — settle スイープの注入実測で
+           100→10ms に短縮し downtime ~280→~196ms。0 は commit リトライ
+           間隔も消すため既定にしない) → PROBE再ネゴ → commit →
+           start_transfer。commit/start_transfer
+           失敗はラウンド内 UVC_RECOVERY_MAX_ATTEMPTS(5)回まで再試行、
+           フレームが戻らない再発は UVC_RECOVERY_MAX_ROUNDS(3)ラウンド
+           まで。ユーザ空間 Lightweight Recovery の実効シーケンスと同一)
+    縮退: 諦めて uvc_queue_cancel(ユーザ空間にエラー伝播 → 方法B が拾う)
+  旧構成の Tier1(一過性エラーURBの即時再サブミット)・URBエラー検知経路
+  (連続エラーカウンタ)・再試行の指数バックオフは、上記実地観測で実働ゼロ
+  (9h/56 wedge で errored completion 0 件・全検知がタイマ経由・全復帰が
+  attempt 1 で成功)を確認し撤去した(事前宣言基準と判定は ADR-0011)。
+  一過性 URB エラー(-EPROTO/-EILSEQ/-ETIME)は静かに再サブミットだけ行う:
+  上流 default の uvc_queue_cancel へ落とすとエラー1発でストリームが
+  ユーザ空間に見える形で死ぬため、ケース分岐を残す。再サブミットは
+  URB プール(UVC_URBS=64)の維持のみが目的 — 無いとエラー1回ごとに URB が
+  1本恒久脱落し、散発エラーの累積が人為的なフレーム断(再循環)を招く。
+  検知・カウンタ・バックオフの類は意図的に置かない(Tier1 撤去の判断は
+  不変)。再サブミット失敗時はそのまま静かに死なせ、フレームが止まれば
+  無フレームタイマが拾い、再循環が全URBを作り直す。
+  生存性の基準は「デコード済みペイロード到着」(uvc_recovery_frame):
+  復帰成功の確定("stream recovered" ログと rounds リセット)も
+  commit/start_transfer の成功ではなくペイロード到着で行う(再循環成功時は
+  UVC_RECOVERY_PENDING を立てるのみ)。正常 completion は生存性に一切
+  寄与させない(bulk の ZLP・ヘッダのみ完了で偽健全化するため)。
+  バッファ未キュー(飢餓)は decode_start の buf==NULL 経路で last_complete
+  を更新し wedge と誤検知しない。
+  grace(grace_until、UVC_RECOVERY_GRACE_MS=1000ms): STREAMON 直後と
+  再循環成功直後は無フレームタイマの stall 判定をミュートする。
+  カメラは (再)commit からペイロード到着まで ~250-300ms かかるため、
+  これが無いと timeout=100ms が起動直後に誤発火 → 再循環 → また間に
+  合わず誤発火のループでラウンド予算を使い切り DEAD になる(実測: 起動
+  4秒で 11 ラウンド消費)。ユーザ空間 Lightweight Recovery の
+  「復帰後 grace period リセット」に対応する。
+  フレーム境界再同期(UVC_RECOVERY_RESYNC + uvc_recovery_resync_done):
+  再循環はカメラのペイロードストリームへ任意の位置から合流するため、
+  そのまま受理すると (a)作りかけバッファへの継ぎ接ぎ、(b)合流後最初の
+  完全フレーム自体のクロマ位相ズレ(U/V 入れ替わり — 2 mod 4 バイトの
+  オフセット。全面緑/マゼンタ化として顕在)の2種類の破損フレームが
+  ユーザ空間へ配送される(6.18 は nodrop=1 既定のため error 付きでも
+  配送される。全長まで埋まった継ぎ接ぎは error すら付かない)。対策は
+  stop_transfer 直後に uvc_queue_rewind_current_buffer で作りかけ
+  バッファを巻き戻し(bytesused=0/QUEUED 化。何も配送しない)、
+  decode_start 冒頭のゲートで FID 変化を UVC_RECOVERY_RESYNC_BOUNDS(3)
+  回観測するまで全ペイロードを破棄する: 合流フレームの残り(1) →
+  最初の完全フレーム=汚染疑い(2) → 次のフレーム先頭(3)で受理再開。
+  復帰境界の破損フレームは一切配送されず、V4L2 側は直前の正常フレームを
+  表示したまま(チューニング後 ~0.26-0.28s のフリーズのみ)クリーンなフレームで再開する。
+  検証: docs/investigations/2026-07-11-kernel-recovery-green-noise.md。
+  有効化: UVC_QUIRK_STREAM_RECOVERY(0x80000000、maxpsize==0 で自動付与)
+  + module param stream_recovery(-1=quirk連動/0=強制OFF/1=強制ON)。
+  検証: per-stream debugfs の stall_inject に書き込むと完了ハンドラが
+  URBを静かに死なせ実wedgeを再現(復帰work起動時に自動クリア)。
+  観測: per-stream debugfs の recovery_stats (0444) が復帰カウンタ5種
+  (stalls_detected / recycle_attempts / recycle_recoveries / giveups /
+  resync_drops_total)を1行1組 "name value" で公開(デバイス probe からの
+  累計。STREAMON ではリセットせず、再列挙では消える。ユーザ空間は2時点の
+  差分で区間値を得る)。機能に無関係な観測専用ノブなので、リベース衝突時は
+  カウンタごと捨ててよい。
+  実測(2026-07-17/18 自然発生56回=チューニング前: 検知 119-204ms +
+  downtime 280-296ms で映像断計 367-467ms。2026-07-18 チューニング後の
+  注入試験: 検知 64-80ms + downtime 176-216ms(settle 0-30ms スイープ、
+  既定10msで196-200ms)で映像断計 ~0.26-0.28 秒。いずれも破損フレーム
+  配送ゼロ、ユーザ空間 watchdog 不発)。
+  マルチカーネル互換(6.12 と 6.16+ の両方に当たる・両方でコンパイル可):
+    - 復帰workのロックは stream->queue.mutex を使う(stream->mutex は
+      6.16+ で削除済み。queue.mutex は両版に存在し、STREAMOFF が保持して
+      stop_streaming に入るため直列化の意味も両版で同一)。
+    - タイマは timer_container_of() を使い、6.16 未満には
+      「#ifndef timer_container_of → from_timer へフォールバック」の
+      互換マクロで対応。
+    - uvc_stream_new への recovery_init 挿入は intfnum 代入行の直後に
+      アンカー(mutex_init 行は 6.16+ に存在しないため使わないこと)。
+  リベース時の指針:
+    - quirk ビット 0x80000000(u32最上位)。上流は下位から昇順に増える
+      ため当分衝突しないが、万一使われたら下のビットへ再割当
+      (参照3箇所: uvcvideo.h 定義, uvc_driver.c の auto-quirk OR,
+       uvc_video.c の uvc_recovery_enabled)。
+    - uvc_video_complete の switch に EPROTO/EILSEQ/ETIME ケースを挿入し
+      「recovery.enabled かつ !frozen なら usb_submit_urb(urb, GFP_ATOMIC)
+      して return(静かに再サブミット。失敗は無視=静かに死なせる)、それ
+      以外は従来の default へ fallthrough」を維持。エラー検知・カウンタ・
+      バックオフは再導入しないこと。ヘルパ uvc_submit_urb は使わないこと
+      (6.16+ に存在せず、エラー経路は CPU 側 DMA sync を経ていないため
+      sync_for_device の戻しも不要 — 素の usb_submit_urb が両版で正しい)。
+    - uvc_video_complete の status==0 では INJECT ドロップ以外何もしない。
+      ここで last_complete/rounds を戻すと bulk の ZLP・ヘッダのみ完了で
+      偽健全化し「検知→偽復帰→再検知」の無限ループが再発する。生存性
+      トラッキングは uvc_recovery_frame(uvc_video_decode_data 先頭 =
+      実ペイロードがバッファへコピーされる合流点)と、decode_start の
+      buf==NULL 経路(last_complete のみ更新。バッファ飢餓の誤検知防止)の
+      2フックで行う — リベース時はこの2フックを必ず維持。
+    - "stream recovered (downtime Xms)" ログは uvc_recovery_frame の
+      PENDING 確定時に出す。文言は tools/kernel_recovery.py がパースする
+      ため変更しないこと(タイマの "no completion for Xms" も同様)。
+    - uvc_commit_video は成功時に正のバイト数を返す。復帰workの成功判定は
+      ret >= 0 で行うこと(== 0 と書くと成功commitを失敗扱いにして
+      永遠に復帰しない)。
+    - 再循環シーケンスの停止側は uvc_video_stop_streaming と同じデバイス
+      種別分岐を維持: frozen=1→stop_transfer(0)→ iso(num_altsetting>1)は
+      alt0 / bulk(単一altsetting。対象カメラがこれ — SuperSpeed bulk EP の
+      wBytesPerInterval=0 が maxpsize=0 の正体)は streaming EP へ
+      usb_clear_halt。SET_INTERFACE(0) は bulk EP の halt を解除しないため、
+      bulk で alt0 だけにすると wedge が解除されず復帰が無限ループする。
+      再開側は frozen=0→clock_reset→PROBE再ネゴ(uvc_probe_video。
+      ユーザ空間 Lightweight Recovery の S_PARM 相当で、COMMIT 単発では
+      届かないデバイス側ネゴシエーション状態のリセットを行う。失敗は
+      非致命でキャッシュ済み ctrl の commit にフォールバック)→commit→
+      start_transfer の順序を維持。
+    - STREAMOFF 側から cancel_work_sync を呼ばない(queue.mutex
+      デッドロック)。work 側の uvc_queue_streaming() 再確認で無害化し、
+      最終解放は uvc_stream_delete の uvc_video_recovery_cleanup で行う。
+    - work 冒頭の滞留判定は uvc_queue_streaming() だけでなく
+      UVC_RECOVERY_ACTIVE ビットも見ること。STREAMON が recovery.flags を
+      リセットするため、ACTIVE クリア = 直前の STREAMOFF→STREAMON を跨いだ
+      stale work を意味する(検査を落とすと健全な新セッションを誤再循環する)。
+      STREAMON と work は共に queue.mutex 下で走るため race しない。
+    - タイマは自己再武装するため:
+      (a) uvc_video_recovery_cleanup(解放前 teardown)は timer_delete_sync
+          ではなく timer_shutdown_sync を使う(再武装した callback の
+          mod_timer を no-op 化し解放後の再発火=UAF を防ぐ)。
+          uvc_video_stop_streaming 側は STREAMON で再武装が要るため
+          timer_delete_sync のままにすること(shutdown は恒久無効化)。
+      (b) callback 冒頭で !recovery.enabled なら return し再武装しない
+          (停止後の再武装ストーム防止 + stop 側 timer_delete_sync を終端化)。
+    - 実効タイムアウトは uvc_recovery_timeout_ms()(param 0=auto で
+      stream->ctrl.dwFrameInterval から算出)に一元化されている。タイマ
+      callback・uvc_video_start_streaming の武装の両方がこれを呼ぶ形を
+      維持し、再武装周期は timeout/4(下限10ms)を崩さない(下限を
+      100ms に戻すと検知遅延が timeout を支配する)。
+    - grace_until の設定2箇所(uvc_video_start_streaming の recovery 初期化
+      / 復帰work の recycle 成功時)とタイマ callback の time_after 判定を
+      必ず維持。落とすと短い実効 timeout(auto=1080p60 で 64ms)が起動直後に自己 DoS する
+      (上記 grace 節参照)。
+    - 復帰work の stop 直後の uvc_queue_rewind_current_buffer + resync
+      状態初期化(resync_fid=-1/resync_bounds=0)+ RESYNC set、および
+      decode_start 冒頭(buf==NULL 経路の直後)の RESYNC ゲートを必ず維持。
+      ゲートは「FID 変化を 3 回観測するまで -ENODATA」で、受理再開時に
+      last_fid = fid ^ UVC_STREAM_FID として直下の既存同期ロジックに
+      フレーム先頭として受理させる。境界数を 2 に減らすと合流フレームの
+      次=クロマ位相ズレ疑いフレームを配送してしまう(緑ノイズ再発)。
+      rewind は uvc_queue.c 側(irqlock 保持)で行い、呼び出しは URB poison
+      + async_wq flush 後(=stop_transfer 後)に限ること。
+    - デバッグログ行は衝突時に捨ててよい。
+
+--- a/uvc/uvcvideo.h
++++ b/uvc/uvcvideo.h
+@@ -83,6 +83,14 @@
+ #define UVC_QUIRK_MSXU_META		0x00040000
+ #define UVC_QUIRK_IGNORE_ZERO_MAXPSIZE	0x20000000
+ #define UVC_QUIRK_IGNORE_GET_CUR	0x40000000
++#define UVC_QUIRK_STREAM_RECOVERY	0x80000000
++
++/* stream->recovery.flags bit numbers */
++#define UVC_RECOVERY_ACTIVE	0	/* recovery work scheduled/running */
++#define UVC_RECOVERY_DEAD	1	/* gave up until next STREAMON */
++#define UVC_RECOVERY_INJECT	2	/* debugfs stall injection armed */
++#define UVC_RECOVERY_PENDING	3	/* recycled, awaiting payload to confirm */
++#define UVC_RECOVERY_RESYNC	4	/* drop payloads until next frame boundary */
+ 
+ /* Format flags */
+ #define UVC_FMT_FLAG_COMPRESSED		0x00000001
+@@ -479,6 +487,36 @@
+ 	unsigned int frozen : 1;
+ 	struct uvc_video_queue queue;
+ 	struct workqueue_struct *async_wq;
++
++	/*
++	 * STREAM_RECOVERY quirk: in-driver stream stall recovery
++	 * (UVC_QUIRK_STREAM_RECOVERY / stream_recovery module param).
++	 */
++	struct {
++		struct work_struct work;
++		struct timer_list timer;
++		unsigned long flags;		/* UVC_RECOVERY_* bit numbers */
++		unsigned long last_complete;	/* jiffies of last decoded payload */
++		unsigned long grace_until;	/* no-frame watchdog muted until then */
++		int resync_fid;			/* FID latched while resyncing (-1 = none) */
++		unsigned int resync_bounds;	/* frame boundaries seen while resyncing */
++		unsigned long stall_jiffies;	/* when current stall was detected */
++		unsigned int rounds;		/* recovery rounds since last good frame */
++		bool enabled;			/* resolved at start_streaming */
++		/*
++		 * Cumulative recovery counters since device probe
++		 * (stream interface lifetime),
++		 * exposed read-only via debugfs "recovery_stats". Never
++		 * reset at STREAMON; observers diff two reads.
++		 */
++		struct {
++			atomic_t stalls_detected;
++			atomic_t recycle_attempts;
++			atomic_t recycle_recoveries;
++			atomic_t giveups;
++			atomic_t resync_drops_total;
++		} stats;
++	} recovery;
+ 	void (*decode)(struct uvc_urb *uvc_urb, struct uvc_buffer *buf,
+ 		       struct uvc_buffer *meta_buf);
+ 
+@@ -667,6 +705,9 @@
+ extern unsigned int uvc_dbg_param;
+ extern unsigned int uvc_timeout_param;
+ extern unsigned int uvc_hw_timestamps_param;
++extern int uvc_stream_recovery_param;
++extern unsigned int uvc_recovery_timeout_param;
++extern unsigned int uvc_recovery_settle_param;
+ 
+ #define uvc_dbg(_dev, flag, fmt, ...)					\
+ do {									\
+@@ -699,6 +740,7 @@
+ struct uvc_buffer *uvc_queue_next_buffer(struct uvc_video_queue *queue,
+ 					 struct uvc_buffer *buf);
+ struct uvc_buffer *uvc_queue_get_current_buffer(struct uvc_video_queue *queue);
++void uvc_queue_rewind_current_buffer(struct uvc_video_queue *queue);
+ void uvc_queue_buffer_release(struct uvc_buffer *buf);
+ static inline int uvc_queue_streaming(struct uvc_video_queue *queue)
+ {
+@@ -723,6 +765,8 @@
+ int uvc_video_init(struct uvc_streaming *stream);
+ int uvc_video_suspend(struct uvc_streaming *stream);
+ int uvc_video_resume(struct uvc_streaming *stream, int reset);
++void uvc_video_recovery_init(struct uvc_streaming *stream);
++void uvc_video_recovery_cleanup(struct uvc_streaming *stream);
+ int uvc_video_start_streaming(struct uvc_streaming *stream);
+ void uvc_video_stop_streaming(struct uvc_streaming *stream);
+ int uvc_probe_video(struct uvc_streaming *stream,
+--- a/uvc/uvc_driver.c
++++ b/uvc/uvc_driver.c
+@@ -36,6 +36,9 @@
+ static unsigned int uvc_quirks_param = -1;
+ unsigned int uvc_dbg_param;
+ unsigned int uvc_timeout_param = UVC_CTRL_STREAMING_TIMEOUT;
++int uvc_stream_recovery_param = -1;
++unsigned int uvc_recovery_timeout_param;	/* 0 = auto (frame-interval based) */
++unsigned int uvc_recovery_settle_param = 10;
+ 
+ static struct usb_driver uvc_driver;
+ 
+@@ -185,6 +188,8 @@
+ 
+ static void uvc_stream_delete(struct uvc_streaming *stream)
+ {
++	uvc_video_recovery_cleanup(stream);
++
+ 	if (stream->async_wq)
+ 		destroy_workqueue(stream->async_wq);
+ 
+@@ -207,6 +212,7 @@
+ 	stream->dev = dev;
+ 	stream->intf = usb_get_intf(intf);
+ 	stream->intfnum = intf->cur_altsetting->desc.bInterfaceNumber;
++	uvc_video_recovery_init(stream);
+ 
+ 	/* Allocate a stream specific work queue for asynchronous tasks. */
+ 	stream->async_wq = alloc_workqueue("uvcvideo", WQ_UNBOUND | WQ_HIGHPRI,
+@@ -798,7 +804,8 @@
+ 		pr_info("uvcvideo: Detected maxpsize=0, applying compatibility quirks\n");
+ 		dev->quirks |= UVC_QUIRK_IGNORE_ZERO_MAXPSIZE
+ 			    | UVC_QUIRK_IGNORE_GET_CUR
+-			    | UVC_QUIRK_PROBE_MINMAX;
++			    | UVC_QUIRK_PROBE_MINMAX
++			    | UVC_QUIRK_STREAM_RECOVERY;
+ 	}
+ 
+ 	list_add_tail(&streaming->list, &dev->streams);
+@@ -2524,6 +2531,15 @@
+ MODULE_PARM_DESC(trace, "Trace level bitmask");
+ module_param_named(timeout, uvc_timeout_param, uint, 0644);
+ MODULE_PARM_DESC(timeout, "Streaming control requests timeout");
++module_param_named(stream_recovery, uvc_stream_recovery_param, int, 0644);
++MODULE_PARM_DESC(stream_recovery,
++		 "In-driver stream stall recovery (-1=auto/quirk, 0=off, 1=force on)");
++module_param_named(recovery_timeout_ms, uvc_recovery_timeout_param, uint, 0644);
++MODULE_PARM_DESC(recovery_timeout_ms,
++		 "Stream recovery no-completion watchdog timeout (ms, 0=auto: 4x frame interval clamped to 30..1000)");
++module_param_named(recovery_settle_ms, uvc_recovery_settle_param, uint, 0644);
++MODULE_PARM_DESC(recovery_settle_ms,
++		 "Stream recovery settle delay between stream stop and restart (ms)");
+ 
+ /* ------------------------------------------------------------------------
+  * Driver initialization and cleanup
+--- a/uvc/uvc_video.c
++++ b/uvc/uvc_video.c
+@@ -1187,6 +1187,61 @@
+  */
+ 
+ /*
++ * Stream recovery: only decoded payload proves the device is really
++ * streaming; URB completions alone (bulk ZLPs, header-only payloads) don't.
++ * Called from the decode path (completion handler context) whenever payload
++ * bytes are copied to a video buffer: pets the no-frame watchdog, resets the
++ * recovery round budget and, when a recovery recycle awaits confirmation,
++ * declares it successful.
++ */
++static void uvc_recovery_frame(struct uvc_streaming *stream)
++{
++	if (!stream->recovery.enabled)
++		return;
++
++	stream->recovery.last_complete = jiffies;
++	stream->recovery.rounds = 0;
++	if (unlikely(test_and_clear_bit(UVC_RECOVERY_PENDING,
++					&stream->recovery.flags))) {
++		atomic_inc(&stream->recovery.stats.recycle_recoveries);
++		dev_info(&stream->intf->dev,
++			 "stream recovered (downtime %ums)\n",
++			 jiffies_to_msecs(jiffies -
++					  stream->recovery.stall_jiffies));
++	}
++}
++
++/*
++ * Stream recovery: payload gate while resynchronizing after a recovery
++ * recycle. The recycle joins the camera's payload stream at an arbitrary
++ * point, and the first complete frame the camera emits after the recycle has
++ * been observed to arrive with its chroma phase shifted (U/V swapped frame,
++ * one per recycle). Both problems are cured by dropping payloads until
++ * UVC_RECOVERY_RESYNC_BOUNDS FID changes have been seen: the partial join
++ * frame and the first complete (possibly phase-shifted) frame are discarded
++ * and delivery resumes on a later, clean frame. Userspace keeps displaying
++ * the last good frame across the whole episode.
++ *
++ * Returns true once the boundary budget is exhausted; the caller then
++ * processes the current payload (the first of a clean frame) normally.
++ */
++#define UVC_RECOVERY_RESYNC_BOUNDS	3
++
++static bool uvc_recovery_resync_done(struct uvc_streaming *stream, u8 fid)
++{
++	if (fid == stream->recovery.resync_fid)
++		return false;
++	stream->recovery.resync_fid = fid;
++	if (++stream->recovery.resync_bounds < UVC_RECOVERY_RESYNC_BOUNDS)
++		return false;
++
++	clear_bit(UVC_RECOVERY_RESYNC, &stream->recovery.flags);
++	/* Let the sync logic below accept this frame-start payload. */
++	stream->last_fid = fid ^ UVC_STREAM_FID;
++	return true;
++}
++
++/*
+  * Video payload decoding is handled by uvc_video_decode_start(),
+  * uvc_video_decode_data() and uvc_video_decode_end().
+  *
+@@ -1261,6 +1316,25 @@
+ 	 */
+ 	if (buf == NULL) {
+ 		stream->last_fid = fid;
++		/*
++		 * A valid payload header proves the device is alive even while
++		 * userspace has no buffer queued; keep the recovery watchdog
++		 * quiet so buffer starvation isn't mistaken for a wedge.
++		 */
++		if (stream->recovery.enabled)
++			stream->recovery.last_complete = jiffies;
++		return -ENODATA;
++	}
++
++	/*
++	 * Stream recovery: after a recovery recycle, drop payloads until
++	 * uvc_recovery_resync_done() clears the resync window (start_transfer
++	 * reset last_fid to -1, which would otherwise accept the very first —
++	 * mid-frame or phase-shifted — payload unconditionally).
++	 */
++	if (unlikely(test_bit(UVC_RECOVERY_RESYNC, &stream->recovery.flags)) &&
++	    !uvc_recovery_resync_done(stream, fid)) {
++		atomic_inc(&stream->recovery.stats.resync_drops_total);
+ 		return -ENODATA;
+ 	}
+ 
+@@ -1394,6 +1468,8 @@
+ 	if (len <= 0)
+ 		return;
+ 
++	uvc_recovery_frame(uvc_urb->stream);
++
+ 	maxlen = buf->length - buf->bytesused;
+ 
+ 	/* Take a buffer reference for async work. */
+@@ -1758,6 +1834,295 @@
+ 	urb->transfer_buffer_length = stream->urb_size - len;
+ }
+ 
++/* ------------------------------------------------------------------------
++ * STREAM_RECOVERY quirk: in-driver stream stall recovery
++ *
++ * Affected cameras wedge: URB completions stop, silently. Field
++ * observation (9h, 56 natural wedges, usbmon-corroborated) found no errored
++ * completion before or during any episode — the wedge is a silent stop, not
++ * an error burst — so detection is a no-frame watchdog timer only. Recover
++ * transparently to userspace:
++ *   recycle the stream (suspend/resume-equivalent) from a work item;
++ *   if that keeps failing, give up and cancel the queue so userspace
++ *   watchdogs take over.
++ */
++
++#define UVC_RECOVERY_MAX_ATTEMPTS	5	/* recycle retries per round */
++#define UVC_RECOVERY_MAX_ROUNDS		3	/* rounds without a good frame */
++/*
++ * Auto timeout (recovery_timeout_ms=0): 4 frame intervals, clamped to
++ * 30..1000ms. Healthy payload gaps are quantized in frame intervals (frame
++ * skips); the longest steady-state gap seen on the bus in the field is
++ * ~2.4 intervals (40.2ms at 60fps, 55min of usbmon around 37 natural
++ * wedges), while a wedge never self-heals, so 4 intervals separates the
++ * two cleanly at any frame rate and low-fps modes scale automatically.
++ */
++#define UVC_RECOVERY_TIMEOUT_FI		4	/* auto timeout, frame intervals */
++#define UVC_RECOVERY_TIMEOUT_MIN_MS	30
++#define UVC_RECOVERY_TIMEOUT_MAX_MS	1000
++/*
++ * Mute the no-frame watchdog for this long after STREAMON and after each
++ * recovery recycle. The camera needs ~250-300ms from (re)commit to the first
++ * payload, so a sub-300ms recovery_timeout_ms would otherwise re-trigger
++ * before the stream can come up and burn the whole round budget on a
++ * healthy device (observed: 11 rounds -> DEAD within 4s of STREAMON at
++ * timeout=100ms). Mirrors the grace-period reset step of the userspace
++ * lightweight recovery this recovery is modeled on.
++ */
++#define UVC_RECOVERY_GRACE_MS		1000
++
++/* Kernels < 6.16 spell timer_container_of() as from_timer(). */
++#ifndef timer_container_of
++#define timer_container_of(var, timer, field) from_timer(var, timer, field)
++#endif
++
++static void uvc_video_stop_transfer(struct uvc_streaming *stream,
++				    int free_buffers);
++static int uvc_video_start_transfer(struct uvc_streaming *stream,
++				    gfp_t gfp_flags);
++
++static bool uvc_recovery_enabled(struct uvc_streaming *stream)
++{
++	if (uvc_stream_recovery_param == 0)
++		return false;
++	if (uvc_stream_recovery_param > 0)
++		return true;
++	return !!(stream->dev->quirks & UVC_QUIRK_STREAM_RECOVERY);
++}
++
++/* Effective no-frame watchdog timeout: fixed param value, or frame-interval
++ * scaled auto default (see UVC_RECOVERY_TIMEOUT_FI). dwFrameInterval is in
++ * 100ns units and already CPU byte order. */
++static unsigned int uvc_recovery_timeout_ms(struct uvc_streaming *stream)
++{
++	unsigned int timeout = READ_ONCE(uvc_recovery_timeout_param);
++
++	if (timeout)
++		return timeout;
++	timeout = UVC_RECOVERY_TIMEOUT_FI * (stream->ctrl.dwFrameInterval / 10000);
++	return clamp(timeout, (unsigned int)UVC_RECOVERY_TIMEOUT_MIN_MS,
++		     (unsigned int)UVC_RECOVERY_TIMEOUT_MAX_MS);
++}
++
++static void uvc_recovery_trigger(struct uvc_streaming *stream)
++{
++	if (test_bit(UVC_RECOVERY_DEAD, &stream->recovery.flags))
++		return;
++	if (test_and_set_bit(UVC_RECOVERY_ACTIVE, &stream->recovery.flags))
++		return;
++	/* rounds is reset only by decoded payload; stamp the episode start. */
++	if (stream->recovery.rounds++ == 0)
++		stream->recovery.stall_jiffies = jiffies;
++	schedule_work(&stream->recovery.work);
++}
++
++static void uvc_recovery_timer_fn(struct timer_list *t)
++{
++	struct uvc_streaming *stream = timer_container_of(stream, t,
++							   recovery.timer);
++	unsigned int timeout = uvc_recovery_timeout_ms(stream);
++
++	/*
++	 * Stop the self-rearming timer once streaming has stopped.
++	 * uvc_video_stop_streaming() clears ->enabled before timer_delete_sync();
++	 * bailing here keeps the timer from resurrecting itself past teardown
++	 * (risking a use-after-free) and avoids an idle re-arm storm.
++	 */
++	if (!stream->recovery.enabled)
++		return;
++
++	if (!test_bit(UVC_RECOVERY_ACTIVE, &stream->recovery.flags) &&
++	    !test_bit(UVC_RECOVERY_DEAD, &stream->recovery.flags) &&
++	    time_after(jiffies, stream->recovery.grace_until) &&
++	    time_after(jiffies, stream->recovery.last_complete +
++			       msecs_to_jiffies(timeout))) {
++		dev_warn(&stream->intf->dev,
++			 "stream stall detected (no completion for %ums), scheduling recovery\n",
++			 timeout);
++		atomic_inc(&stream->recovery.stats.stalls_detected);
++		uvc_recovery_trigger(stream);
++	}
++
++	/* Poll at a quarter of the timeout so re-arm granularity stays a
++	 * small fraction of the detection latency (was a flat 100ms floor,
++	 * which dominated detection at timeout<=100ms: 119-204ms measured). */
++	mod_timer(&stream->recovery.timer,
++		  jiffies + msecs_to_jiffies(max(timeout / 4, 10u)));
++}
++
++static void uvc_recovery_work(struct work_struct *work)
++{
++	struct uvc_streaming *stream =
++		container_of(work, struct uvc_streaming, recovery.work);
++	struct uvc_streaming_control probe;
++	unsigned int attempt = 0;
++	int ret;
++
++	/*
++	 * queue.mutex serializes against STREAMOFF (which holds it while
++	 * calling uvc_video_stop_streaming) on every supported kernel;
++	 * stream->mutex no longer exists on 6.16+.
++	 */
++	mutex_lock(&stream->queue.mutex);
++
++	/* Injection served its purpose once a stall was detected. */
++	clear_bit(UVC_RECOVERY_INJECT, &stream->recovery.flags);
++
++	/*
++	 * The ACTIVE bit is this work's scheduling token. STREAMON
++	 * (uvc_video_start_streaming) resets recovery.flags, so a cleared
++	 * ACTIVE here means a STREAMOFF/STREAMON cycle raced ahead of us: this
++	 * work is stale and must not recycle the new session's healthy stream.
++	 * STREAMON and this work both run under queue.mutex, so this is race-free.
++	 */
++	if (!test_bit(UVC_RECOVERY_ACTIVE, &stream->recovery.flags) ||
++	    !uvc_queue_streaming(&stream->queue) || stream->frozen)
++		goto done;
++
++	if (stream->recovery.rounds > UVC_RECOVERY_MAX_ROUNDS) {
++		dev_err(&stream->intf->dev,
++			"stream recovery ineffective after %u rounds, giving up\n",
++			stream->recovery.rounds);
++		goto giveup;
++	}
++
++	while (uvc_queue_streaming(&stream->queue)) {
++		attempt++;
++		atomic_inc(&stream->recovery.stats.recycle_attempts);
++		dev_info(&stream->intf->dev, "stream recovery attempt %u\n",
++			 attempt);
++
++		/*
++		 * Suspend-equivalent: freeze, kill URBs, then tell the device
++		 * the stream stopped the same way uvc_video_stop_streaming()
++		 * does: alt setting 0 for isochronous devices, CLEAR_FEATURE
++		 * (HALT) on the streaming endpoint for bulk devices (the
++		 * affected cameras). SET_INTERFACE(0) does not clear a halted bulk
++		 * endpoint, so a wedged device would survive the recycle and
++		 * recovery would loop forever.
++		 */
++		stream->frozen = 1;
++		uvc_video_stop_transfer(stream, 0);
++		if (stream->intf->num_altsetting > 1) {
++			usb_set_interface(stream->dev->udev, stream->intfnum, 0);
++		} else {
++			unsigned int epnum = stream->header.bEndpointAddress
++					   & USB_ENDPOINT_NUMBER_MASK;
++			unsigned int dir = stream->header.bEndpointAddress
++					 & USB_ENDPOINT_DIR_MASK;
++			unsigned int pipe;
++
++			pipe = usb_sndbulkpipe(stream->dev->udev, epnum) | dir;
++			usb_clear_halt(stream->dev->udev, pipe);
++		}
++
++		/*
++		 * Abandon the partially assembled frame and resynchronize to
++		 * the next frame boundary. The recycle joins the camera's
++		 * payload stream at an arbitrary byte offset; splicing that
++		 * into a half-filled buffer (or starting a fresh one mid-
++		 * frame) breaks the YUY2 byte phase and flashes a green/
++		 * magenta frame. Dropping payloads until the FID toggles
++		 * costs at most one camera frame and keeps userspace showing
++		 * the last good frame across the recycle instead.
++		 */
++		uvc_queue_rewind_current_buffer(&stream->queue);
++		stream->recovery.resync_fid = -1;
++		stream->recovery.resync_bounds = 0;
++		set_bit(UVC_RECOVERY_RESYNC, &stream->recovery.flags);
++
++		{
++			unsigned int settle = READ_ONCE(uvc_recovery_settle_param);
++
++			if (settle)
++				msleep(settle);
++		}
++
++		/* Resume-equivalent: unfreeze, re-probe, re-commit, rebuild URBs. */
++		stream->frozen = 0;
++		uvc_video_clock_reset(&stream->clock);
++
++		/*
++		 * PROBE renegotiation, mirroring what userspace lightweight
++		 * recovery triggers via VIDIOC_S_PARM: a full SET_CUR/GET_CUR
++		 * PROBE round resets the device's UVC negotiation state machine
++		 * in a way a lone COMMIT does not. Concurrent S_FMT/S_PARM are
++		 * locked out while streaming, so stream->ctrl is ours. Probe
++		 * failure is not fatal: fall back to committing the cached
++		 * control, as userspace lightweight recovery does.
++		 */
++		probe = stream->ctrl;
++		if (uvc_probe_video(stream, &probe) >= 0)
++			stream->ctrl = probe;
++
++		/* uvc_commit_video() returns a positive byte count on success. */
++		ret = uvc_commit_video(stream, &stream->ctrl);
++		if (ret < 0) {
++			dev_warn(&stream->intf->dev,
++				 "recovery: commit failed (%d)\n", ret);
++		} else {
++			ret = uvc_video_start_transfer(stream, GFP_KERNEL);
++			if (ret < 0)
++				dev_warn(&stream->intf->dev,
++					 "recovery: start_transfer failed (%d)\n",
++					 ret);
++		}
++		if (ret >= 0) {
++			/*
++			 * commit/start_transfer succeeding only proves the
++			 * control plane is alive; the wedge is cleared only
++			 * once payload actually arrives. uvc_recovery_frame()
++			 * then confirms (logs "stream recovered") and resets
++			 * the round budget; until that happens the no-frame
++			 * timer keeps the episode open.
++			 */
++			stream->recovery.last_complete = jiffies;
++			stream->recovery.grace_until = jiffies +
++				msecs_to_jiffies(UVC_RECOVERY_GRACE_MS);
++			set_bit(UVC_RECOVERY_PENDING, &stream->recovery.flags);
++			uvc_dbg(stream->dev, VIDEO,
++				"stream recycled (attempt %u), awaiting payload\n",
++				attempt);
++			goto done;
++		}
++
++		if (attempt >= UVC_RECOVERY_MAX_ATTEMPTS) {
++			dev_err(&stream->intf->dev,
++				"stream recovery failed after %u attempts, giving up\n",
++				attempt);
++			goto giveup;
++		}
++	}
++	goto done;
++
++giveup:
++	/* Wake userspace with an error; method-B watchdogs take over. */
++	atomic_inc(&stream->recovery.stats.giveups);
++	clear_bit(UVC_RECOVERY_PENDING, &stream->recovery.flags);
++	set_bit(UVC_RECOVERY_DEAD, &stream->recovery.flags);
++	uvc_queue_cancel(&stream->queue, 0);
++done:
++	clear_bit(UVC_RECOVERY_ACTIVE, &stream->recovery.flags);
++	mutex_unlock(&stream->queue.mutex);
++}
++
++void uvc_video_recovery_init(struct uvc_streaming *stream)
++{
++	INIT_WORK(&stream->recovery.work, uvc_recovery_work);
++	timer_setup(&stream->recovery.timer, uvc_recovery_timer_fn, 0);
++}
++
++void uvc_video_recovery_cleanup(struct uvc_streaming *stream)
++{
++	/*
++	 * timer_shutdown_sync() (not timer_delete_sync) because the timer
++	 * re-arms itself: shutdown makes any in-flight callback's mod_timer()
++	 * a no-op, so the timer cannot resurrect after the stream is freed.
++	 */
++	timer_shutdown_sync(&stream->recovery.timer);
++	cancel_work_sync(&stream->recovery.work);
++}
++
+ static void uvc_video_complete(struct urb *urb)
+ {
+ 	struct uvc_urb *uvc_urb = urb->context;
+@@ -1772,8 +2137,46 @@
+ 
+ 	switch (urb->status) {
+ 	case 0:
++		/*
++		 * Note a good completion carries no liveness meaning: liveness
++		 * (no-frame watchdog, round budget) is tracked by decoded
++		 * payload in uvc_recovery_frame() only. Bulk ZLP / header-only
++		 * completions must not reset it, or a wedged device that still
++		 * completes empty URBs would look healthy forever.
++		 */
++		if (stream->recovery.enabled) {
++			/* Stall injection: silently drop good completions. */
++			if (unlikely(test_bit(UVC_RECOVERY_INJECT,
++					      &stream->recovery.flags)))
++				return;
++		}
+ 		break;
+ 
++	case -EPROTO:		/* Transient URB errors. */
++	case -EILSEQ:
++	case -ETIME:
++		/*
++		 * Quietly resubmit a transiently-errored URB instead of taking
++		 * the default uvc_queue_cancel() path (which would kill the
++		 * stream for userspace on the first error). The resubmit only
++		 * keeps the URB pool intact: without it every transient error
++		 * would permanently leak one of the URBs until frames stop and
++		 * the recovery recycle rebuilds all of them. No error-side
++		 * detection, counter or backoff exists on purpose: field
++		 * observation (9h, 56 natural wedges) never saw an errored
++		 * completion. If the resubmit fails, the URB dies quietly and
++		 * the no-frame watchdog covers the fallout.
++		 *
++		 * Raw usb_submit_urb, not the uvc_submit_urb helper: the helper
++		 * does not exist on 6.16+, and its extra sync_for_device is not
++		 * needed here anyway - the error path never synced the buffer
++		 * for CPU access, so ownership never left the device.
++		 */
++		if (stream->recovery.enabled && !stream->frozen) {
++			usb_submit_urb(urb, GFP_ATOMIC);
++			return;
++		}
++		fallthrough;
+ 	default:
+ 		dev_warn(&stream->intf->dev,
+ 			 "Non-zero status (%d) in video completion handler.\n",
+@@ -2405,9 +2808,32 @@
+ 	if (ret < 0)
+ 		goto error_commit;
+ 
++	/*
++	 * Publish recovery state BEFORE start_transfer submits live URBs:
++	 * completions run on another CPU and gate on ->enabled, and the URB
++	 * submission below is the release barrier. Enabling afterwards would
++	 * let an early -EPROTO/-EILSEQ/-ETIME slip through to the default
++	 * uvc_queue_cancel() path instead of dying quietly under recovery.
++	 */
++	stream->recovery.enabled = uvc_recovery_enabled(stream);
++	if (stream->recovery.enabled) {
++		stream->recovery.flags = 0;
++		stream->recovery.rounds = 0;
++		stream->recovery.last_complete = jiffies;
++		stream->recovery.grace_until = jiffies +
++			msecs_to_jiffies(UVC_RECOVERY_GRACE_MS);
++	}
++
+ 	ret = uvc_video_start_transfer(stream, GFP_KERNEL);
+-	if (ret < 0)
++	if (ret < 0) {
++		stream->recovery.enabled = false;
+ 		goto error_video;
++	}
++
++	/* Arm the no-frame watchdog only once URBs are live. */
++	if (stream->recovery.enabled)
++		mod_timer(&stream->recovery.timer,
++			  jiffies + msecs_to_jiffies(uvc_recovery_timeout_ms(stream)));
+ 
+ 	return 0;
+ 
+@@ -2421,6 +2847,17 @@
+ 
+ void uvc_video_stop_streaming(struct uvc_streaming *stream)
+ {
++	/*
++	 * Stop the recovery watchdog. Do NOT cancel_work_sync() here: this
++	 * path runs with queue.mutex held and the recovery work takes the
++	 * same mutex (it re-checks uvc_queue_streaming() and bails instead).
++	 * Final synchronous teardown happens in uvc_video_recovery_cleanup().
++	 */
++	if (stream->recovery.enabled) {
++		stream->recovery.enabled = false;
++		timer_delete_sync(&stream->recovery.timer);
++	}
++
+ 	uvc_video_stop_transfer(stream, 1);
+ 
+ 	if (stream->intf->num_altsetting > 1) {
+--- a/uvc/uvc_queue.c
++++ b/uvc/uvc_queue.c
+@@ -351,6 +351,30 @@
+ }
+ 
+ /*
++ * uvc_queue_rewind_current_buffer: Abandon a partially assembled frame
++ *
++ * Stream recovery: rewind the current working buffer to its pristine
++ * queued state so the next accepted payload fills it from offset zero. Must
++ * only be called with the decode path quiesced (URBs poisoned and async_wq
++ * flushed by uvc_video_stop_transfer); nothing is delivered to userspace.
++ */
++void uvc_queue_rewind_current_buffer(struct uvc_video_queue *queue)
++{
++	struct uvc_buffer *buf;
++	unsigned long flags;
++
++	spin_lock_irqsave(&queue->irqlock, flags);
++	buf = __uvc_queue_get_current_buffer(queue);
++	if (buf != NULL) {
++		buf->error = 0;
++		buf->state = UVC_BUF_STATE_QUEUED;
++		buf->bytesused = 0;
++		vb2_set_plane_payload(&buf->buf.vb2_buf, 0, 0);
++	}
++	spin_unlock_irqrestore(&queue->irqlock, flags);
++}
++
++/*
+  * uvc_queue_buffer_requeue: Requeue a buffer on our internal irqqueue
+  *
+  * Reuse a buffer through our internal queue without the need to 'prepare'.
+--- a/uvc/uvc_debugfs.c
++++ b/uvc/uvc_debugfs.c
+@@ -64,6 +64,67 @@
+ };
+ 
+ /* -----------------------------------------------------------------------------
++ * Stream recovery: stall injection (test knob for in-driver stream recovery)
++ *
++ * Writing anything arms UVC_RECOVERY_INJECT: the completion handler silently
++ * drops URBs, reproducing the silent frame stall of a real wedge. The flag is
++ * cleared automatically when the recovery work runs.
++ */
++
++static ssize_t uvc_debugfs_stall_inject_write(struct file *file,
++					      const char __user *user_buf,
++					      size_t nbytes, loff_t *ppos)
++{
++	struct uvc_streaming *stream = file->private_data;
++
++	dev_warn(&stream->intf->dev, "stall injection armed via debugfs\n");
++	set_bit(UVC_RECOVERY_INJECT, &stream->recovery.flags);
++	return nbytes;
++}
++
++static const struct file_operations uvc_debugfs_stall_inject_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = uvc_debugfs_stall_inject_write,
++};
++
++/*
++ * Stream recovery: cumulative recovery counters (read-only observation knob).
++ * One "name value" pair per line. Values are cumulative since device
++ * probe (reset on re-enumeration, never at STREAMON); observers diff
++ * two reads for a per-run interval.
++ * Unlike the neighboring 'stats' file this formats live values per
++ * read; readers are expected to fetch in one read() (cat).
++ */
++static ssize_t uvc_debugfs_recovery_stats_read(struct file *file,
++					       char __user *user_buf,
++					       size_t nbytes, loff_t *ppos)
++{
++	struct uvc_streaming *stream = file->private_data;
++	char buf[256];
++	int len;
++
++	len = scnprintf(buf, sizeof(buf),
++			"stalls_detected %d\n"
++			"recycle_attempts %d\n"
++			"recycle_recoveries %d\n"
++			"giveups %d\n"
++			"resync_drops_total %d\n",
++			atomic_read(&stream->recovery.stats.stalls_detected),
++			atomic_read(&stream->recovery.stats.recycle_attempts),
++			atomic_read(&stream->recovery.stats.recycle_recoveries),
++			atomic_read(&stream->recovery.stats.giveups),
++			atomic_read(&stream->recovery.stats.resync_drops_total));
++	return simple_read_from_buffer(user_buf, nbytes, ppos, buf, len);
++}
++
++static const struct file_operations uvc_debugfs_recovery_stats_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.read = uvc_debugfs_recovery_stats_read,
++};
++
++/* -----------------------------------------------------------------------------
+  * Global and stream initialization/cleanup
+  */
+ 
+@@ -85,6 +146,10 @@
+ 
+ 	debugfs_create_file("stats", 0444, stream->debugfs_dir, stream,
+ 			    &uvc_debugfs_stats_fops);
++	debugfs_create_file("stall_inject", 0200, stream->debugfs_dir, stream,
++			    &uvc_debugfs_stall_inject_fops);
++	debugfs_create_file("recovery_stats", 0444, stream->debugfs_dir, stream,
++			    &uvc_debugfs_recovery_stats_fops);
+ }
+ 
+ void uvc_debugfs_cleanup_stream(struct uvc_streaming *stream)
+
+================================================================================
+ [全ファイル] GPLv2 第2条(a) の変更告知 ("Modified by" コメント)
+================================================================================
+意図:
+  GPLv2 第2条(a) は「改変したファイルに、改変した旨と日付の目立つ告知を付す」
+  ことを求める。改変する 5 ファイルの先頭 (SPDX 行直後) に告知コメントを挿入する。
+  機能には無関係。他の hunk がすべて当たった後に適用されるようパッチ末尾に置き、
+  行番号は元ファイル先頭固定なので調整不要。リベース時は年を更新する。
+
+--- a/uvc/uvcvideo.h
++++ b/uvc/uvcvideo.h
+@@ -1,4 +1,9 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Modified by Shingo Noguchi, 2026: USB camera compatibility quirks and
++ * in-driver stream recovery. Distributed under GPL-2.0-only; see
++ * uvc-modifications.patch at https://github.com/go-surgeons/uvc-patch
++ */
+ #ifndef _USB_VIDEO_H_
+ #define _USB_VIDEO_H_
+ 
+
+--- a/uvc/uvc_driver.c
++++ b/uvc/uvc_driver.c
+@@ -1,4 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Modified by Shingo Noguchi, 2026: USB camera compatibility quirks and
++ * in-driver stream recovery. Distributed under GPL-2.0-only; see
++ * uvc-modifications.patch at https://github.com/go-surgeons/uvc-patch
++ */
+ /*
+  *      uvc_driver.c  --  USB Video Class driver
+  *
+
+--- a/uvc/uvc_video.c
++++ b/uvc/uvc_video.c
+@@ -1,4 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Modified by Shingo Noguchi, 2026: USB camera compatibility quirks and
++ * in-driver stream recovery. Distributed under GPL-2.0-only; see
++ * uvc-modifications.patch at https://github.com/go-surgeons/uvc-patch
++ */
+ /*
+  *      uvc_video.c  --  USB Video Class driver - Video handling
+  *
+
+--- a/uvc/uvc_queue.c
++++ b/uvc/uvc_queue.c
+@@ -1,4 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Modified by Shingo Noguchi, 2026: USB camera compatibility quirks and
++ * in-driver stream recovery. Distributed under GPL-2.0-only; see
++ * uvc-modifications.patch at https://github.com/go-surgeons/uvc-patch
++ */
+ /*
+  *      uvc_queue.c  --  USB Video Class driver - Buffers management
+  *
+
+--- a/uvc/uvc_debugfs.c
++++ b/uvc/uvc_debugfs.c
+@@ -1,4 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Modified by Shingo Noguchi, 2026: USB camera compatibility quirks and
++ * in-driver stream recovery. Distributed under GPL-2.0-only; see
++ * uvc-modifications.patch at https://github.com/go-surgeons/uvc-patch
++ */
+ /*
+  *      uvc_debugfs.c --  USB Video Class driver - Debugging support
+  *
